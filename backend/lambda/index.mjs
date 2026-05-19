@@ -570,8 +570,8 @@ async function createNavigator(body) {
   const tags = expertise_tags ?? specialties ?? [];
   const result = await pool.query(
     `INSERT INTO navigator_profiles
-       (auth0_user_id, nav_group, expertise_tags, languages, capacity, status, is_general_intake, timezone)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+       (auth0_user_id, nav_group, expertise_tags, languages, capacity, status, is_general_intake, timezone, first_name, last_name)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
     [
       auth0_user_id,
       nav_group,
@@ -581,6 +581,8 @@ async function createNavigator(body) {
       status ?? "offline",
       is_general_intake ?? false,
       body.timezone ?? "America/New_York",
+      body.first_name ?? "",
+      body.last_name ?? "",
     ]
   );
   return respond(201, result.rows[0]);
