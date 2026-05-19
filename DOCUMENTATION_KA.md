@@ -1,4 +1,4 @@
-# Handoff Documentation — Katherine Alderete
+# Handoff Documentation — BACKEND
 
 Covers: Matrix service account bot, session endpoints, routing algorithm, navigator intake form, transfer requests, and encryption.
 

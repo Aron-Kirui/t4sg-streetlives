@@ -133,6 +133,17 @@ async function verifyAuth0Token(authHeader) {
 // Ties broken randomly to prevent one navigator from absorbing all tie cases.
 const ROUTING_VERSION = "v4_capacity_gated_load_balanced";
 
+async function fetchLoadMap() {
+  const result = await pool.query(
+    `SELECT navigator_id, COUNT(*) as count FROM sessions
+     WHERE status = 'active' AND navigator_id IS NOT NULL
+     GROUP BY navigator_id`
+  );
+  const loadMap = {};
+  for (const row of result.rows) loadMap[row.navigator_id] = parseInt(row.count, 10);
+  return loadMap;
+}
+
 function assignNavigator(navigators, getActiveLoad, input, mode = "initial") {
   void mode;
 
@@ -142,7 +153,7 @@ function assignNavigator(navigators, getActiveLoad, input, mode = "initial") {
   }
 
   const lang = input.language?.toLowerCase() ?? null;
-  let pool = available;
+  let candidates = available;
   if (lang) {
     const withLang = available.filter((n) =>
       (n.languages ?? []).map((l) => l.toLowerCase()).includes(lang)
@@ -150,19 +161,20 @@ function assignNavigator(navigators, getActiveLoad, input, mode = "initial") {
     if (withLang.length === 0) {
       return { assigned: false, reason: `No available navigator speaks "${input.language}"` };
     }
-    pool = withLang;
+    candidates = withLang;
   }
 
   // Prefer navigators with remaining capacity; fall back to all if everyone is full.
-  const withCapacity = pool.filter((n) => getActiveLoad(n.id) < n.capacity);
-  const candidates = withCapacity.length > 0 ? withCapacity : pool;
+  const withCapacity = candidates.filter((n) => getActiveLoad(n.id) < n.capacity);
+  if (withCapacity.length > 0) candidates = withCapacity;
 
   const ranked = candidates
-    .map((nav) => ({
-      nav,
-      loadRatio: getActiveLoad(nav.id) / nav.capacity,
-      jitter: Math.random(),
-    }))
+    .map((nav) => {
+      const cap = Number(nav.capacity);
+      const load = getActiveLoad(nav.id);
+      const loadRatio = cap > 0 ? load / cap : 0;
+      return { nav, loadRatio, jitter: Math.random() };
+    })
     .sort((a, b) => a.loadRatio - b.loadRatio || a.jitter - b.jitter);
 
   const best = ranked[0];
@@ -222,17 +234,40 @@ async function createSession(event) {
   const navsResult = await pool.query("SELECT * FROM navigator_profiles");
   const navigators = navsResult.rows;
 
-  const loadResult = await pool.query(
-    `SELECT navigator_id, COUNT(*) as count FROM sessions
-     WHERE status = 'active' AND navigator_id IS NOT NULL
-     GROUP BY navigator_id`
-  );
-  const loadMap = {};
-  for (const row of loadResult.rows) loadMap[row.navigator_id] = parseInt(row.count);
+  const loadMap = await fetchLoadMap();
   const getActiveLoad = (navId) => loadMap[navId] ?? 0;
 
-  // 3. Run routing
-  const outcome = assignNavigator(navigators, getActiveLoad, { needCategory, language, tags });
+  // 3. Routing is owned entirely by the Next.js layer, which runs the richer algorithm
+  // (schedule windows, expertise-tag tiers, load balancing). It passes its pick as
+  // navigator_id in the request body. If no navigator_id is present, Next.js found no
+  // eligible navigator and the session should be created unassigned (queued).
+  const requestedNavId = body.navigator_id ?? body.navigatorId ?? null;
+  const requestedNav = requestedNavId
+    ? navigators.find((n) => n.id === requestedNavId && n.status === "available")
+    : null;
+  console.log(
+    `[createSession] requestedNavId=${requestedNavId ?? "none"} requestedNavFound=${!!requestedNav} loadMap=${JSON.stringify(loadMap)}`,
+  );
+
+  let outcome;
+  if (requestedNav) {
+    const cap = Number(requestedNav.capacity);
+    const load = getActiveLoad(requestedNav.id);
+    outcome = {
+      assigned: true,
+      navigator: requestedNav,
+      routingReason: {
+        languageRequested: language,
+        languageMatch: true,
+        loadRatio: cap > 0 ? load / cap : 0,
+        score: cap > 0 ? -load / cap : 0,
+        source: "caller_pick",
+      },
+    };
+  } else {
+    // Next.js either found no eligible navigator or sent no pick — fall back to Lambda routing.
+    outcome = assignNavigator(navigators, getActiveLoad, { needCategory, language });
+  }
 
   const status = outcome.assigned ? "active" : "unassigned";
   const navigatorId = outcome.assigned ? outcome.navigator.id : null;
@@ -280,13 +315,7 @@ async function createSession(event) {
 }
 
 async function getSessionLoad() {
-  const result = await pool.query(
-    `SELECT navigator_id, COUNT(*) as count FROM sessions
-     WHERE status = 'active' AND navigator_id IS NOT NULL
-     GROUP BY navigator_id`
-  );
-  const load = {};
-  for (const row of result.rows) load[row.navigator_id] = parseInt(row.count);
+  const load = await fetchLoadMap();
   return respond(200, { load });
 }
 
@@ -419,12 +448,7 @@ async function transferSession(sessionId, body, actorId) {
 
   const navsResult = await pool.query("SELECT * FROM navigator_profiles");
   const navigators = navsResult.rows;
-  const loadResult = await pool.query(
-    `SELECT navigator_id, COUNT(*) as count FROM sessions
-     WHERE status='active' AND navigator_id IS NOT NULL GROUP BY navigator_id`
-  );
-  const loadMap = {};
-  for (const row of loadResult.rows) loadMap[row.navigator_id] = parseInt(row.count);
+  const loadMap = await fetchLoadMap();
   const getActiveLoad = (navId) => loadMap[navId] ?? 0;
 
   let newNavigatorId;
@@ -701,6 +725,19 @@ export const handler = async (event) => {
       return await createSession(event);
     }
 
+    // GET /sessions/load — must come before GET /sessions/:id to prevent "load" being
+    // treated as a session UUID (which causes PostgreSQL to throw a type error → 500).
+    if (method === "GET" && segments[0] === "sessions" && segments[1] === "load") {
+      let jwtPayload;
+      try {
+        jwtPayload = await verifyAuth0Token(authHeader);
+        void jwtPayload;
+      } catch (err) {
+        return respond(401, { error: "Unauthorized: " + err.message });
+      }
+      return await getSessionLoad();
+    }
+
     // GET /sessions/:id  (token in query string)
     if (method === "GET" && segments[0] === "sessions" && segments.length === 2 && !segments[2]) {
       const token = qs.token ?? null;
@@ -737,11 +774,6 @@ export const handler = async (event) => {
       return respond(401, { error: "Unauthorized: " + err.message });
     }
     const actorSub = jwtPayload.sub?.endsWith("@clients") ? "user" : jwtPayload.sub;
-
-    // GET /sessions/load  (no role required, any valid JWT)
-    if (method === "GET" && segments[0] === "sessions" && segments[1] === "load") {
-      return await getSessionLoad();
-    }
 
     // GET /sessions  (list all)
     if (method === "GET" && segments[0] === "sessions" && segments.length === 1) {

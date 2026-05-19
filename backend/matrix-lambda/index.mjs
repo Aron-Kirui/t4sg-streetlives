@@ -66,7 +66,7 @@ async function getToken() {
   return cachedToken;
 }
 
-async function matrixRequest(method, path, body) {
+async function matrixRequest(method, path, body, retriesLeft = 3) {
   const baseUrl = process.env.MATRIX_BASE_URL;
   const token = await getToken();
 
@@ -79,9 +79,20 @@ async function matrixRequest(method, path, body) {
     body: method !== "GET" ? JSON.stringify(body) : undefined,
   });
 
-  // Token rejected — force re-login once and retry
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
+
+    // Rate limited — honour retry_after_ms from the server, cap at 10 s
+    if (res.status === 429 && retriesLeft > 0) {
+      const waitMs = Math.min(err.retry_after_ms ?? 5000, 10000);
+      console.warn(
+        `[matrixRequest] Rate limited on ${method} ${path} — waiting ${waitMs}ms then retrying (${retriesLeft} left)`,
+      );
+      await new Promise((r) => setTimeout(r, waitMs));
+      return matrixRequest(method, path, body, retriesLeft - 1);
+    }
+
+    // Token rejected — force re-login once and retry
     if (err.errcode === "M_UNKNOWN_TOKEN") {
       console.warn("[matrixAuth] Token rejected — re-logging in");
       cachedToken = null;
@@ -102,6 +113,7 @@ async function matrixRequest(method, path, body) {
       }
       return retry.json();
     }
+
     throw new Error(
       `Matrix ${method} ${path} failed [${res.status}]: ${err.error ?? "unknown"} (${err.errcode ?? "no errcode"})`
     );
@@ -135,39 +147,58 @@ async function deleteRoom(roomId) {
   const baseUrl = process.env.MATRIX_BASE_URL;
   const token = await getToken();
 
-  // Try Synapse Admin API first (requires bot to be a server admin).
-  // This permanently purges the room and all its events.
-  const adminRes = await fetch(
-    `${baseUrl}/_synapse/admin/v2/rooms/${encodeURIComponent(roomId)}/delete`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({ purge: true, block: false }),
+  // Kick all joined members (except the bot) so they are removed from the room.
+  try {
+    const botUserId = process.env.MATRIX_BOT_USER_ID;
+    const membersData = await matrixRequest("GET", `/rooms/${encodeURIComponent(roomId)}/members`, null);
+    const joinedMembers = (membersData.chunk ?? [])
+      .filter((ev) => ev.content?.membership === "join" && ev.state_key !== botUserId)
+      .map((ev) => ev.state_key);
+
+    for (const userId of joinedMembers) {
+      try {
+        await matrixRequest("POST", `/rooms/${encodeURIComponent(roomId)}/kick`, {
+          user_id: userId,
+          reason: "Session deleted",
+        });
+      } catch (err) {
+        console.warn(`[deleteRoom] Failed to kick ${userId} from ${roomId}:`, err.message);
+      }
     }
-  );
-
-  if (adminRes.status === 404) {
-    return { deleted: true, method: "not_found" };
+  } catch (err) {
+    console.warn(`[deleteRoom] Failed to fetch/kick members for ${roomId}:`, err.message);
   }
 
-  if (adminRes.ok) {
-    return { deleted: true, method: "admin_delete" };
-  }
-
-  // Bot is not a server admin (or homeserver is not Synapse) — fall back to
-  // having the bot leave the room so it becomes inaccessible.
-  const statusText = adminRes.status;
-  console.warn(`[deleteRoom] Admin delete failed (${statusText}), falling back to leave`);
+  // Bot account always leaves the room.
   try {
     await matrixRequest("POST", `/rooms/${encodeURIComponent(roomId)}/leave`, {});
+    console.log(`[deleteRoom] Bot left room ${roomId}`);
   } catch (err) {
-    // Room may already be gone or bot already left — not fatal.
-    console.warn(`[deleteRoom] Leave fallback failed for ${roomId}:`, err.message);
+    console.warn(`[deleteRoom] Leave failed for ${roomId}:`, err.message);
   }
-  return { deleted: true, method: "leave_fallback" };
+
+  // Best-effort Synapse admin purge for full server-side cleanup (requires bot to be server admin).
+  try {
+    const adminRes = await fetch(
+      `${baseUrl}/_synapse/admin/v2/rooms/${encodeURIComponent(roomId)}/delete`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ purge: true, block: false }),
+      }
+    );
+    if (adminRes.ok) {
+      return { deleted: true, method: "admin_purge" };
+    }
+    console.warn(`[deleteRoom] Admin purge skipped (${adminRes.status}) — bot may not be server admin`);
+  } catch (err) {
+    console.warn(`[deleteRoom] Admin purge request failed for ${roomId}:`, err.message);
+  }
+
+  return { deleted: true, method: "leave" };
 }
 
 async function fetchMessages(roomId) {
