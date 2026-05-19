@@ -122,12 +122,19 @@ When a guest starts a chat, the routing algorithm automatically selects the best
 
 | File | Role |
 |------|------|
-| [matrix-chat/backend/src/services/routingService.ts](matrix-chat/backend/src/services/routingService.ts) | The core algorithm, used at session creation, transfer, and queue processing |
-| [matrix-chat/backend/src/routes/routing.ts](matrix-chat/backend/src/routes/routing.ts) | `POST /api/routing/assign` — test endpoint to preview routing without creating a session |
-| [src/lib/routing.ts](src/lib/routing.ts) | A copy of the algorithm that runs on the web app side before the session is created |
-| [matrix-chat/backend/src/__tests__/routingService.test.ts](matrix-chat/backend/src/__tests__/routingService.test.ts) | Unit tests covering all routing scenarios |
+| [src/lib/routing.ts](src/lib/routing.ts) | Core algorithm (`pickNavigator`) — runs on the Next.js side before the session is created |
+| [src/app/api/guest/sessions/route.ts](src/app/api/guest/sessions/route.ts) | Calls the routing algorithm, fetches live load data, and sends the pick to the Lambda |
+| [backend/lambda/index.mjs](backend/lambda/index.mjs) | VPC Lambda — receives the routing pick and creates the session in the database |
 
-**How the algorithm works (version `v6_tiered_category_lang_schedule_capacity`):**
+**Two-layer architecture:**
+
+Routing runs in two stages to work around infrastructure constraints (the VPC Lambda has database access but the Next.js layer has richer context):
+
+1. **Next.js layer** — runs the full algorithm before calling the Lambda. Fetches the navigator list and live active-session counts (`GET /sessions/load`) in parallel, then picks the best navigator. Sends the chosen navigator's ID to the Lambda as `navigator_id` in the request body.
+
+2. **Lambda layer** — if a valid `navigator_id` is provided, the Lambda uses it directly (no independent routing). If Next.js sends no pick (no eligible navigator found), the Lambda falls back to its own simpler load-based algorithm before creating the session as `unassigned`.
+
+**How the algorithm works:**
 
 The algorithm filters and ranks navigators in this order:
 
@@ -220,11 +227,11 @@ A guest can request a new navigator from the chat UI. This does not automaticall
 
 ### 7. Encryption
 
-Matrix rooms are currently created **without end-to-end encryption**. This was an intentional decision for the initial build — encryption adds complexity to the client setup and was deferred.
+**Transport encryption (in place):** All messages are protected in transit by HTTPS/TLS. Every request between the guest's browser, the Next.js app, the Lambda backend, and the Matrix homeserver travels over an encrypted connection. This means messages cannot be intercepted over Wi-Fi or the internet — which is the protection level our clients require.
 
-**What this means in practice:** Messages in the Matrix room are readable by anyone with room access (including the service bot account and any Matrix homeserver admin). The application-side data stores are not affected.
+**End-to-end encryption (intentionally not enabled):** Matrix supports E2E encryption, but it is deliberately not used. Supervisors need to be able to read message history for oversight, coaching, and quality assurance. E2E encryption would make messages unreadable to anyone except the two participants, which is incompatible with that requirement. Disabling it is not a gap — it is a product decision.
 
-**Upgrade path:** Encryption can be enabled later without changing any of the session or routing logic. The change is isolated to two places in [matrixService.ts](matrix-chat/backend/src/services/matrixService.ts): adding an encryption state event when a room is created, and initializing the crypto library on any client that reads messages. This is documented in the file.
+**Who can read messages:** The bot account, any Matrix homeserver admin, navigators assigned to the room, and supervisors via the dashboard. Guests can only read their own session's messages.
 
 ---
 
@@ -268,10 +275,8 @@ The app runs at `http://localhost:3000`.
 
 3. **Real-time messaging** — the chat UI currently polls for new messages on a 5-second interval. Switching to Matrix `/sync` (a long-poll connection that the server holds open until new messages arrive) would make the chat feel instant.
 
-4. **Encrypt Matrix rooms** — as noted above, the upgrade path is documented and isolated. This should be done before any sensitive conversations happen over the platform.
+4. **Auto-reassign when a navigator goes offline** — if a navigator changes their status to `away` or `offline`, their active sessions are not automatically reassigned. A future update to the `PATCH /api/navigators/:id` handler could detect this and trigger reassignment.
 
-5. **Auto-reassign when a navigator goes offline** — if a navigator changes their status to `away` or `offline`, their active sessions are not automatically reassigned. A future update to the `PATCH /api/navigators/:id` handler could detect this and trigger reassignment.
+5. **Surface the guest transfer request more prominently** — the flag exists and is tracked, but it should be clearly visible as a badge or alert on the navigator/supervisor dashboard so transfer requests don't get missed.
 
-6. **Surface the guest transfer request more prominently** — the flag exists and is tracked, but it should be clearly visible as a badge or alert on the navigator/supervisor dashboard so transfer requests don't get missed.
-
-7. **Use navigator name instead of Matrix ID for message labels** — navigator messages in the chat are currently labeled using the navigator's Matrix username, which can look awkward (e.g., `@jane-doe:matrix.org` → `Jane Doe`). Since first and last name are already stored on the profile, those should be used directly.
+6. **Use navigator name instead of Matrix ID for message labels** — navigator messages in the chat are currently labeled using the navigator's Matrix username, which can look awkward (e.g., `@jane-doe:matrix.org` → `Jane Doe`). Since first and last name are already stored on the profile, those should be used directly.

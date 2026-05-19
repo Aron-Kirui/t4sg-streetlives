@@ -107,6 +107,11 @@ export async function POST(req: Request) {
     if ((n.capacity ?? 0) <= 0) reasons.push(`capacity=${n.capacity}`);
     if (!isWithinSchedule(n.availability_schedule, now, n.timezone)) reasons.push("outside-schedule");
     if (load !== null && (n.capacity ?? 0) > 0 && load >= (n.capacity ?? 0)) reasons.push(`overload=${load}/${n.capacity}`);
+    if (language) {
+      const langFull = (ISO_TO_FULL[language.toLowerCase()] ?? language).toLowerCase().replace(/[\s_-]/g, "");
+      const speaks = n.languages?.some((l) => l.toLowerCase().replace(/[\s_-]/g, "") === langFull);
+      if (!speaks) reasons.push(`no-lang:${language}`);
+    }
     console.log(
       `[session:create]   nav=${n.id.slice(0, 8)} status=${n.status} cap=${n.capacity} load=${load} ` +
       `sched=${JSON.stringify(n.availability_schedule)} ` +

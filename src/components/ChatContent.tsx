@@ -226,6 +226,31 @@ export function ChatContent({ onClose }: ChatContentProps) {
     setIsStarting(true);
     setError(null);
     try {
+      // Fast routing check — runs routing without creating a session (~1-2s).
+      // If no navigator is available, show the queue screen immediately rather
+      // than waiting 30+ seconds for the Lambda to time out.
+      const checkParams = new URLSearchParams({ needCategory });
+      if (language) checkParams.set("language", language);
+      const checkRes = await fetch(`/api/guest/sessions/check?${checkParams}`).catch(() => null);
+      const check = checkRes?.ok ? await checkRes.json().catch(() => null) : null;
+
+      if (check && check.hasNavigator === false) {
+        const reason = "No navigators are currently available. Please try again later.";
+        setChatState("waiting");
+        setQueuedReason(reason);
+        localStorage.setItem("sl_session_state", "waiting");
+        localStorage.setItem("sl_session_queued_reason", reason);
+        setIsStarting(false);
+        // Fire session creation in background so it gets queued in the DB.
+        // If it fails (503), update the queue message with a reload prompt.
+        createSession(needCategory, language).catch(() => {
+          const reloadReason = "We're having trouble right now. Please reload the page to try again.";
+          setQueuedReason(reloadReason);
+          localStorage.setItem("sl_session_queued_reason", reloadReason);
+        });
+        return;
+      }
+
       const session = await createSession(needCategory, language);
       const { sessionId: id, sessionUserToken: token, status } = session;
 
@@ -264,7 +289,16 @@ export function ChatContent({ onClose }: ChatContentProps) {
         startStatusPolling(id, token);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to start chat. Please try again.");
+      const msg = err instanceof Error ? err.message : "";
+      if (msg.startsWith("queue:")) {
+        const reason = msg.slice("queue:".length);
+        setChatState("waiting");
+        setQueuedReason(reason);
+        localStorage.setItem("sl_session_state", "waiting");
+        localStorage.setItem("sl_session_queued_reason", reason);
+      } else {
+        setError(msg || "Failed to start chat. Please try again.");
+      }
     } finally {
       setIsStarting(false);
     }
