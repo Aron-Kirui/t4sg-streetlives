@@ -191,7 +191,8 @@ function assignNavigator(navigators, getActiveLoad, input, mode = "initial") {
 }
 
 const VALID_NEED_CATEGORIES = [
-  "housing", "employment", "health", "benefits", "youth_services", "education", "other",
+  "accommodations", "food", "clothing", "personal_care", "health",
+  "family_services", "work", "legal", "connection", "other",
 ];
 
 function respond(statusCode, body) {
